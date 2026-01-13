@@ -20,7 +20,7 @@ st.set_page_config(page_title="Painel Mesa de Análise — VELOX", layout="wide"
 st.title("🧮 Painel Mesa de Análise — VELOX")
 
 # Cor padrão dos gráficos
-CHART_COLOR = "#595959"
+CHART_COLOR = "#730000"
 
 st.markdown(
     """
@@ -34,6 +34,10 @@ st.markdown(
 .section{font-size:18px;font-weight:800;margin:22px 0 8px}
 .small{color:#666;font-size:13px}
 .table-note{margin-top:8px;color:#666;font-size:12px}
+.badge{display:inline-block;padding:4px 8px;border-radius:999px;font-weight:800;font-size:12px}
+.badge.ok{background:#e7f6ea;color:#1b5e20;border:1px solid #bfe6c7}
+.badge.low{background:#fdecea;color:#8a1c1c;border:1px solid #f5c2c2}
+.badge.high{background:#fff4e5;color:#7a4a00;border:1px solid #ffd59a}
 </style>
 """,
     unsafe_allow_html=True,
@@ -144,10 +148,12 @@ def bar_with_labels(df, x_col, y_col, x_title="", y_title="QTD", height=320):
 def bar_with_qty_and_perc(df, x_col, y_qty, y_perc, x_title="", height=320):
     """
     Rótulo: "QTD (xx,x%)"
-    Eixo Y = QTD (mantém igual ao seu visual), mas mostra % no rótulo.
+    Eixo Y = QTD, mas mostra % no rótulo.
     """
     df = df.copy()
-    df["LABEL"] = df.apply(lambda r: f"{int(r[y_qty])} ({float(r[y_perc]):.1f}%)".replace(".", ","), axis=1)
+    df["LABEL"] = df.apply(
+        lambda r: f"{int(r[y_qty])} ({float(r[y_perc]):.1f}%)".replace(".", ","), axis=1
+    )
 
     base = alt.Chart(df).encode(
         x=alt.X(
@@ -177,9 +183,7 @@ def looks_like_plate(s: str) -> bool:
     t = str(s).strip().upper()
     if not t:
         return False
-    # remove espaços e hifens
     t = re.sub(r"[^A-Z0-9]", "", t)
-    # formatos comuns: ABC1D23 (mercosul) ou ABC1234 (antiga)
     return bool(re.fullmatch(r"[A-Z]{3}\d[A-Z]\d{2}", t) or re.fullmatch(r"[A-Z]{3}\d{4}", t))
 
 # ------------------ CONEXÃO COM GOOGLE ------------------
@@ -557,6 +561,103 @@ if not base_analista.empty:
         labels = base_chart.mark_text(dy=-6).encode(text=alt.Text("TEMPO_MEDIO:N"))
         st.altair_chart((bars + labels).properties(height=340), use_container_width=True)
 
+# ------------------ NOVO: PARTICIPAÇÃO DA PRODUÇÃO POR ANALISTA (META 25% ±3pp) ------------------
+st.markdown("---")
+st.markdown('<div class="section">Produção por analista em % (meta: 25% ± 3pp)</div>', unsafe_allow_html=True)
+
+META_PERC = 25.0
+MARGEM_PP = 3.0
+LIM_INF = META_PERC - MARGEM_PP  # 22
+LIM_SUP = META_PERC + MARGEM_PP  # 28
+
+if base_analista.empty:
+    st.info("Sem registros de 'ANALISTA MESA' no recorte atual para calcular a participação.")
+else:
+    share = (
+        base_analista.groupby("USUARIO", dropna=False)["OS"]
+        .size()
+        .reset_index(name="QTD")
+    )
+    total_qtd = int(share["QTD"].sum())
+    share["PERC"] = share["QTD"] / total_qtd * 100 if total_qtd else 0.0
+    share["DELTA_PP"] = share["PERC"] - META_PERC
+
+    def _status_row(p):
+        if p < LIM_INF:
+            return "Abaixo"
+        if p > LIM_SUP:
+            return "Acima"
+        return "Dentro"
+
+    share["STATUS"] = share["PERC"].apply(_status_row)
+
+    # Indicadores (cards por analista)
+    share_sorted = share.sort_values("PERC", ascending=False).copy()
+    cols = st.columns(min(len(share_sorted), 4))
+    for i, (_, r) in enumerate(share_sorted.iterrows()):
+        col = cols[i % len(cols)]
+        perc_txt = f"{r['PERC']:.1f}%".replace(".", ",")
+        delta_txt = f"{r['DELTA_PP']:+.1f} pp".replace(".", ",")
+        if r["STATUS"] == "Dentro":
+            badge = "<span class='badge ok'>DENTRO</span>"
+            arrow = "▲" if r["DELTA_PP"] >= 0 else "▼"
+        elif r["STATUS"] == "Abaixo":
+            badge = "<span class='badge low'>ABAIXO</span>"
+            arrow = "▼"
+        else:
+            badge = "<span class='badge high'>ACIMA</span>"
+            arrow = "▲"
+
+        with col:
+            st.markdown(
+                f"""
+                <div class='card'>
+                  <h4>{r['USUARIO']}</h4>
+                  <h2>{perc_txt}</h2>
+                  <div class='small'>{arrow} {delta_txt} vs 25%</div>
+                  <div style="margin-top:8px">{badge}</div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+
+    # Gráfico em % + linhas de meta e limites
+    share_plot = share_sorted.copy()
+    share_plot["PERC_LABEL"] = share_plot["PERC"].map(lambda v: f"{v:.1f}%".replace(".", ","))
+
+    base_s = alt.Chart(share_plot).encode(
+        x=alt.X("USUARIO:N", title="Analista", axis=alt.Axis(labelAngle=0, labelLimit=180)),
+        y=alt.Y("PERC:Q", title="% da produção (Analista Mesa)"),
+        tooltip=[
+            alt.Tooltip("USUARIO:N", title="Analista"),
+            alt.Tooltip("QTD:Q", title="Qtd análises", format=".0f"),
+            alt.Tooltip("PERC:Q", title="%", format=".1f"),
+            alt.Tooltip("STATUS:N", title="Status"),
+        ],
+    )
+
+    bars_s = base_s.mark_bar(color=CHART_COLOR)
+    labels_s = base_s.mark_text(dy=-6).encode(text="PERC_LABEL:N")
+
+    # Linhas (meta e margem)
+    df_rules = pd.DataFrame(
+        {
+            "VALOR": [LIM_INF, META_PERC, LIM_SUP],
+            "TIPO": ["Limite inferior (22%)", "Meta (25%)", "Limite superior (28%)"],
+        }
+    )
+    rules = alt.Chart(df_rules).mark_rule(strokeDash=[6, 4], color="#666").encode(
+        y="VALOR:Q",
+        tooltip=[alt.Tooltip("TIPO:N", title="Referência"), alt.Tooltip("VALOR:Q", title="%", format=".1f")],
+    )
+
+    st.altair_chart((bars_s + labels_s + rules).properties(height=320), use_container_width=True)
+
+    # Tabela resumida (opcional, já com status)
+    resumo = share_sorted[["USUARIO", "QTD", "PERC", "STATUS"]].copy()
+    resumo["PERC"] = resumo["PERC"].map(lambda v: f"{v:.1f}%".replace(".", ","))
+    st.dataframe(resumo, use_container_width=True, hide_index=True)
+
 # ------------------ TEMPO TOTAL POR ETAPA (IMPORTANTE) ------------------
 st.markdown("---")
 st.markdown('<div class="section">Tempo total por etapa (mesa / fila / vistoriador)</div>', unsafe_allow_html=True)
@@ -803,3 +904,4 @@ if not fast_mode:
         st.dataframe(detc, use_container_width=True, hide_index=True)
 
         st.caption('<div class="table-note">Cada linha representa uma crítica da mesa (aprovada ou reprovada).</div>', unsafe_allow_html=True)
+
