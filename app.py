@@ -20,7 +20,7 @@ st.set_page_config(page_title="Painel Mesa de Análise — VELOX", layout="wide"
 st.title("🧮 Painel Mesa de Análise — VELOX")
 
 # Cor padrão dos gráficos
-CHART_COLOR = "#730000"
+CHART_COLOR = "#595959"
 
 st.markdown(
     """
