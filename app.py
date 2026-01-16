@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 # ============================================================
 # Painel Mesa de Análise — VELOX (multi-meses)
+# (com leitura robusta Google Sheets + retry/backoff + não derruba por mês)
 # ============================================================
 
-import os, json, re, unicodedata
+import os, json, re, unicodedata, time
 from datetime import datetime, date
 from typing import Optional, Tuple
 
@@ -14,6 +15,7 @@ import altair as alt
 
 import gspread
 from oauth2client.service_account import ServiceAccountCredentials
+from gspread.exceptions import APIError, GSpreadException
 
 # ------------------ CONFIG BÁSICA ------------------
 st.set_page_config(page_title="Painel Mesa de Análise — VELOX", layout="wide")
@@ -51,7 +53,7 @@ ID_RE = re.compile(r"/d/([a-zA-Z0-9-_]+)")
 def _sheet_id(s: str) -> Optional[str]:
     if not s:
         return None
-    s = s.strip()
+    s = str(s).strip()
     m = ID_RE.search(s)
     if m:
         return m.group(1)
@@ -74,18 +76,15 @@ def parse_date_any(x):
     # excel serial
     if isinstance(x, (int, float)) and not isinstance(x, bool):
         try:
-            return (pd.to_datetime("1899-12-30") +
-                    pd.to_timedelta(int(x), unit="D")).date()
+            return (pd.to_datetime("1899-12-30") + pd.to_timedelta(int(x), unit="D")).date()
         except Exception:
             pass
     s = str(x).strip()
-    # tenta datetime com hora
     for fmt in ("%d/%m/%Y %H:%M:%S", "%d/%m/%Y %H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"):
         try:
             return datetime.strptime(s, fmt).date()
         except Exception:
             pass
-    # tenta só data
     for fmt in ("%d/%m/%Y", "%Y-%m-%d", "%d-%m-%Y", "%d/%m/%y"):
         try:
             return datetime.strptime(s, fmt).date()
@@ -140,9 +139,7 @@ def bar_with_labels(df, x_col, y_col, x_title="", y_title="QTD", height=320):
         tooltip=[x_col, y_col],
     )
     bars = base.mark_bar(color=CHART_COLOR)
-    labels = base.mark_text(dy=-6).encode(
-        text=alt.Text(f"{y_col}:Q", format=".0f")
-    )
+    labels = base.mark_text(dy=-6).encode(text=alt.Text(f"{y_col}:Q", format=".0f"))
     return (bars + labels).properties(height=height)
 
 def bar_with_qty_and_perc(df, x_col, y_qty, y_perc, x_title="", height=320):
@@ -174,10 +171,6 @@ def bar_with_qty_and_perc(df, x_col, y_qty, y_perc, x_title="", height=320):
     return (bars + labels).properties(height=height)
 
 def looks_like_plate(s: str) -> bool:
-    """
-    Heurística simples: placa Mercosul/antiga costuma ter 7 caracteres e mistura letras/números.
-    Se não parecer placa, tratamos como chassi (1º emplacamento).
-    """
     if s is None:
         return False
     t = str(s).strip().upper()
@@ -214,10 +207,53 @@ def _get_client():
         "https://www.googleapis.com/auth/drive.readonly",
     ]
     creds = ServiceAccountCredentials.from_json_keyfile_dict(info, scopes)
-    gc = gspread.authorize(creds)
-    return gc
+    return gspread.authorize(creds)
 
 client = _get_client()
+
+# ------------------ LEITURA ROBUSTA (retry + get_all_values) ------------------
+def _open_by_key_retry(gc, sheet_id: str, tries: int = 5, base_sleep: float = 1.0):
+    last = None
+    for i in range(tries):
+        try:
+            return gc.open_by_key(sheet_id)
+        except Exception as e:
+            last = e
+            time.sleep(base_sleep * (2 ** i))
+    raise last
+
+def _ws_values_retry(ws, tries: int = 5, base_sleep: float = 1.0):
+    last = None
+    for i in range(tries):
+        try:
+            return ws.get_all_values()
+        except Exception as e:
+            last = e
+            time.sleep(base_sleep * (2 ** i))
+    raise last
+
+def sheet_to_df(ws) -> pd.DataFrame:
+    values = _ws_values_retry(ws)
+    if not values or len(values) < 2:
+        return pd.DataFrame()
+    header = [str(h).strip() for h in values[0]]
+    data = values[1:]
+
+    # nomes únicos
+    seen = {}
+    fixed = []
+    for h in header:
+        h2 = h if h else "COL"
+        if h2 in seen:
+            seen[h2] += 1
+            h2 = f"{h2}_{seen[h2]}"
+        else:
+            seen[h2] = 0
+        fixed.append(h2)
+
+    df = pd.DataFrame(data, columns=fixed)
+    df = df.replace("", np.nan).dropna(how="all").fillna("")
+    return df
 
 # ------------------ LEITURA DO ÍNDICE ------------------
 ANALISTAS_INDEX_ID = st.secrets.get("analistas_index_sheet_id", "").strip()
@@ -225,34 +261,35 @@ if not ANALISTAS_INDEX_ID:
     st.error("Faltou `analistas_index_sheet_id` no secrets.toml")
     st.stop()
 
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def read_index(sheet_id: str, tab: str) -> pd.DataFrame:
-    sh = client.open_by_key(sheet_id)
+    sh = _open_by_key_retry(client, sheet_id)
     try:
         ws = sh.worksheet(tab)
     except Exception as e:
         raise RuntimeError(f"O índice não possui aba '{tab}'.") from e
-    rows = ws.get_all_records()
-    if not rows:
+
+    df = sheet_to_df(ws)
+    if df.empty:
         return pd.DataFrame(columns=["URL", "MÊS", "ATIVO"])
-    df = pd.DataFrame(rows)
-    df.columns = [c.strip().upper() for c in df.columns]
+
+    df.columns = [str(c).strip().upper() for c in df.columns]
     for need in ["URL", "MÊS", "ATIVO"]:
         if need not in df.columns:
             df[need] = ""
     return df
 
 # ------------------ LEITURA MENSAL — PRODUÇÃO ------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def read_producao_month(sheet_id: str) -> Tuple[pd.DataFrame, str]:
-    sh = client.open_by_key(sheet_id)
+    sh = _open_by_key_retry(client, sheet_id)
     title = sh.title or sheet_id
     ws = sh.sheet1
-    rows = ws.get_all_records()
-    if not rows:
+
+    df = sheet_to_df(ws)
+    if df.empty:
         return pd.DataFrame(), title
 
-    df = pd.DataFrame(rows)
     df.columns = [str(c).strip() for c in df.columns]
 
     rename = {}
@@ -301,16 +338,16 @@ def read_producao_month(sheet_id: str) -> Tuple[pd.DataFrame, str]:
     return df, title
 
 # ------------------ LEITURA MENSAL — CRÍTICA ------------------
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=900, show_spinner=False)
 def read_critica_month(sheet_id: str) -> Tuple[pd.DataFrame, str]:
-    sh = client.open_by_key(sheet_id)
+    sh = _open_by_key_retry(client, sheet_id)
     title = sh.title or sheet_id
     ws = sh.sheet1
-    rows = ws.get_all_records()
-    if not rows:
+
+    df = sheet_to_df(ws)
+    if df.empty:
         return pd.DataFrame(), title
 
-    df = pd.DataFrame(rows)
     df.columns = [str(c).strip() for c in df.columns]
 
     rename = {}
@@ -365,24 +402,37 @@ if not sel_meses:
 idx_prod = idx_prod[idx_prod["MÊS"].isin(sel_meses)]
 idx_crit = idx_crit[idx_crit["MÊS"].isin(sel_meses)]
 
-# ------------------ LÊ TODOS OS MESES ------------------
+# ------------------ LÊ TODOS OS MESES (não derruba por mês) ------------------
 prod_all, crit_all = [], []
+falhas_prod, falhas_crit = [], []
 
 for _, r in idx_prod.iterrows():
     sid = _sheet_id(r["URL"])
     if not sid:
         continue
-    df, _ = read_producao_month(sid)
-    if not df.empty:
-        prod_all.append(df)
+    try:
+        df, _ = read_producao_month(sid)
+        if not df.empty:
+            prod_all.append(df)
+    except Exception:
+        falhas_prod.append((str(r.get("MÊS","")), sid))
 
 for _, r in idx_crit.iterrows():
     sid = _sheet_id(r["URL"])
     if not sid:
         continue
-    df, _ = read_critica_month(sid)
-    if not df.empty:
-        crit_all.append(df)
+    try:
+        df, _ = read_critica_month(sid)
+        if not df.empty:
+            crit_all.append(df)
+    except Exception:
+        falhas_crit.append((str(r.get("MÊS","")), sid))
+
+if falhas_prod:
+    st.warning(f"Falha temporária ao ler PRODUÇÃO de {len(falhas_prod)} mês(es).")
+
+if falhas_crit:
+    st.warning(f"Falha temporária ao ler CRÍTICA de {len(falhas_crit)} mês(es). O índice de apontamentos pode ficar incompleto até atualizar.")
 
 if not prod_all:
     st.error("Não consegui ler dados de PRODUÇÃO de nenhum mês.")
@@ -425,7 +475,6 @@ with col1:
     )
 
 start_d, end_d = drange if isinstance(drange, tuple) and len(drange) == 2 else (min_d, max_d)
-
 mask_dias = s_mes_dates.map(lambda d: isinstance(d, date) and start_d <= d <= end_d)
 viewProd = dfProd_mes[mask_dias].copy()
 
@@ -567,8 +616,8 @@ st.markdown('<div class="section">Produção por analista em % (meta: 25% ± 3pp
 
 META_PERC = 25.0
 MARGEM_PP = 3.0
-LIM_INF = META_PERC - MARGEM_PP  # 22
-LIM_SUP = META_PERC + MARGEM_PP  # 28
+LIM_INF = META_PERC - MARGEM_PP
+LIM_SUP = META_PERC + MARGEM_PP
 
 if base_analista.empty:
     st.info("Sem registros de 'ANALISTA MESA' no recorte atual para calcular a participação.")
@@ -591,11 +640,10 @@ else:
 
     share["STATUS"] = share["PERC"].apply(_status_row)
 
-    # Indicadores (cards por analista)
     share_sorted = share.sort_values("PERC", ascending=False).copy()
-    cols = st.columns(min(len(share_sorted), 4))
+    cols_cards = st.columns(min(len(share_sorted), 4))
     for i, (_, r) in enumerate(share_sorted.iterrows()):
-        col = cols[i % len(cols)]
+        col = cols_cards[i % len(cols_cards)]
         perc_txt = f"{r['PERC']:.1f}%".replace(".", ",")
         delta_txt = f"{r['DELTA_PP']:+.1f} pp".replace(".", ",")
         if r["STATUS"] == "Dentro":
@@ -621,7 +669,6 @@ else:
                 unsafe_allow_html=True,
             )
 
-    # Gráfico em % + linhas de meta e limites
     share_plot = share_sorted.copy()
     share_plot["PERC_LABEL"] = share_plot["PERC"].map(lambda v: f"{v:.1f}%".replace(".", ","))
 
@@ -639,11 +686,10 @@ else:
     bars_s = base_s.mark_bar(color=CHART_COLOR)
     labels_s = base_s.mark_text(dy=-6).encode(text="PERC_LABEL:N")
 
-    # Linhas (meta e margem)
     df_rules = pd.DataFrame(
         {
             "VALOR": [LIM_INF, META_PERC, LIM_SUP],
-            "TIPO": ["Limite inferior (22%)", "Meta (25%)", "Limite superior (28%)"],
+            "TIPO": ["Limite inferior", "Meta", "Limite superior"],
         }
     )
     rules = alt.Chart(df_rules).mark_rule(strokeDash=[6, 4], color="#666").encode(
@@ -653,12 +699,11 @@ else:
 
     st.altair_chart((bars_s + labels_s + rules).properties(height=320), use_container_width=True)
 
-    # Tabela resumida (opcional, já com status)
     resumo = share_sorted[["USUARIO", "QTD", "PERC", "STATUS"]].copy()
     resumo["PERC"] = resumo["PERC"].map(lambda v: f"{v:.1f}%".replace(".", ","))
     st.dataframe(resumo, use_container_width=True, hide_index=True)
 
-# ------------------ TEMPO TOTAL POR ETAPA (IMPORTANTE) ------------------
+# ------------------ TEMPO TOTAL POR ETAPA ------------------
 st.markdown("---")
 st.markdown('<div class="section">Tempo total por etapa (mesa / fila / vistoriador)</div>', unsafe_allow_html=True)
 
@@ -689,7 +734,7 @@ st.markdown('<div class="section">Índices de qualidade</div>', unsafe_allow_htm
 
 q1, q2, q3 = st.columns(3)
 
-# 1) ÍNDICE DE APONTAMENTOS (CRÍTICA, 1ª análise) — COM FALLBACK (NÃO ZERA)
+# 1) ÍNDICE DE APONTAMENTOS (CRÍTICA, 1ª análise) — COM FALLBACK
 with q1:
     st.subheader("Índice de apontamentos (mesa de análise)")
 
@@ -904,4 +949,3 @@ if not fast_mode:
         st.dataframe(detc, use_container_width=True, hide_index=True)
 
         st.caption('<div class="table-note">Cada linha representa uma crítica da mesa (aprovada ou reprovada).</div>', unsafe_allow_html=True)
-
